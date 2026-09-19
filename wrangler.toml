@@ -1,0 +1,48 @@
+name = "gh-proxy"
+main = "src/index.ts"
+compatibility_date = "2025-09-06"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gh-proxy"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "CACHE_BUCKET"
+bucket_name = "gh-proxy-cache"
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
+[[durable_objects.bindings]]
+name = "ADMIN_HUB"
+class_name = "AdminHubDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiterDO", "AdminHubDO"]
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+BASE_URL = "http://localhost:8787"
+MAX_CACHE_TIME = "300"
+MAX_CACHE_SIZE_MB = "100"
+MAX_PROXY_BODY_BYTES = "1048576"
+ALLOWED_VERIFICATION_STATUSES = "verified_eligible,verified_eligible_18_plus"
+ADMIN_BOOTSTRAP_HC_USER_IDS = ""
+
+# Secrets (set with `wrangler secret put <NAME>`, or in `.dev.vars` for local dev):
+#   GITHUB_OAUTH_CLIENT_ID
+#   GITHUB_OAUTH_CLIENT_SECRET
+#   HACKCLUB_OAUTH_CLIENT_ID
+#   HACKCLUB_OAUTH_CLIENT_SECRET
+#   TOKEN_ENCRYPTION_KEY   (32 random bytes, base64-encoded — `openssl rand -base64 32`)
+#   SESSION_SIGNING_KEY    (32 random bytes, base64-encoded — `openssl rand -base64 32`)

@@ -1,0 +1,93 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "gh-proxy",
+    "description": "A community-run Hack Club GitHub API proxy. Anyone with an eligible Hack Club Auth account can get a rate-limited API key by donating a GitHub token; anyone at all can donate a token to the shared pool.",
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/": { "get": { "summary": "Home page", "responses": { "200": { "description": "OK" } } } },
+    "/docs": { "get": { "summary": "Human-readable API documentation", "responses": { "200": { "description": "OK" } } } },
+    "/openapi.json": { "get": { "summary": "This document", "responses": { "200": { "description": "OK" } } } },
+    "/llms.txt": { "get": { "summary": "Site map for agents (llmstxt.org format)", "responses": { "200": { "description": "OK" } } } },
+    "/robots.txt": { "get": { "summary": "Crawler policy", "responses": { "200": { "description": "OK" } } } },
+    "/sitemap.xml": { "get": { "summary": "XML sitemap", "responses": { "200": { "description": "OK" } } } },
+    "/donate": {
+      "get": {
+        "summary": "Donate a GitHub token to the shared pool (no account required)",
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/get-access": {
+      "get": {
+        "summary": "Self-serve API key page: Hack Club Auth login + GitHub token donation",
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/get-access/generate-key": {
+      "post": {
+        "summary": "Mint an API key for the logged-in, eligible, donated Hack Club identity",
+        "responses": {
+          "200": { "description": "Key created; shown once in the response body" },
+          "401": { "description": "Not logged in via Hack Club Auth", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Not eligible, or has not donated a token yet", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/get-access/regenerate-key": {
+      "post": {
+        "summary": "Rotate the caller's existing API key; old key is invalidated immediately",
+        "responses": { "200": { "description": "New key shown once" } }
+      }
+    },
+    "/gh/{path}": {
+      "get": { "summary": "GitHub REST proxy (GET)", "parameters": [{ "name": "path", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "GitHub's response, forwarded verbatim" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "429": { "$ref": "#/components/responses/RateLimited" } } },
+      "post": { "summary": "GitHub REST proxy (POST)", "parameters": [{ "name": "path", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "GitHub's response, forwarded verbatim" } } },
+      "patch": { "summary": "GitHub REST proxy (PATCH)", "parameters": [{ "name": "path", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "GitHub's response, forwarded verbatim" } } },
+      "put": { "summary": "GitHub REST proxy (PUT)", "parameters": [{ "name": "path", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "GitHub's response, forwarded verbatim" } } },
+      "delete": { "summary": "GitHub REST proxy (DELETE)", "parameters": [{ "name": "path", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "GitHub's response, forwarded verbatim" } } }
+    },
+    "/gh/graphql": {
+      "post": {
+        "summary": "GitHub GraphQL proxy",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "query": { "type": "string" } } } } } },
+        "responses": { "200": { "description": "GitHub's GraphQL response, forwarded verbatim" } }
+      }
+    },
+    "/admin": { "get": { "summary": "Admin dashboard (Hack Club Auth + allow-list)", "responses": { "200": { "description": "OK" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
+    "/admin/ws": { "get": { "summary": "Live admin stats WebSocket", "responses": { "101": { "description": "Switching protocols" } } } },
+    "/admin/keys.json": { "get": { "summary": "API key list + usage (admin only)", "responses": { "200": { "description": "OK" } } } },
+    "/admin/keys_usage.json": { "get": { "summary": "7-day per-key daily usage (admin only)", "responses": { "200": { "description": "OK" } } } },
+    "/admin/recent.json": { "get": { "summary": "Recent request log (admin only)", "responses": { "200": { "description": "OK" } } } },
+    "/admin/apikeys/{id}/disable": { "post": { "summary": "Disable an API key (admin only)", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "303": { "description": "Redirect back to /admin" } } } }
+  },
+  "components": {
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" },
+              "hint": { "type": "string" },
+              "documentation_url": { "type": "string" },
+              "links": { "type": "array", "items": { "type": "object", "properties": { "rel": { "type": "string" }, "href": { "type": "string" }, "description": { "type": "string" } } } }
+            },
+            "required": ["code", "message"]
+          }
+        }
+      }
+    },
+    "responses": {
+      "Unauthorized": { "description": "Missing or invalid X-API-Key", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Forbidden": { "description": "Key disabled, or caller not on the admin allow-list", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "RateLimited": { "description": "Per-key rate limit exceeded; see Retry-After", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    },
+    "securitySchemes": {
+      "ApiKeyAuth": { "type": "apiKey", "in": "header", "name": "X-API-Key" }
+    }
+  },
+  "security": [{ "ApiKeyAuth": [] }]
+}
