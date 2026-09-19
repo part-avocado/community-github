@@ -9,7 +9,7 @@ enabled = true
 [[d1_databases]]
 binding = "DB"
 database_name = "gh-proxy"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "b7407012-3ce7-4ff2-a50a-18b132985787"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
