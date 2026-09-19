@@ -1,149 +1,123 @@
 # gh-proxy
 
-A lightweight Go service backed by Postgres that proxies the GitHub REST and GraphQL APIs. It provides:
+A community-run GitHub REST/GraphQL API proxy, hosted entirely on Cloudflare (**Workers**, **D1**, **R2**, **Durable Objects**). It's a shared pool of donated GitHub tokens behind a cached, rate-limited proxy:
 
-- **Pooled “donated” tokens** with automatic rotation by API category (core/search/code_search/graphql)
-- **DB-backed caching** of GET/HEAD responses with TTL and size limits
-- **Per‑key rate limiting**
-- A simple **admin UI** to create/disable API keys and view usage
+- **Self-serve API keys.** Log in with [Hack Club Auth](https://auth.hackclub.com) (you need a "verified eligible" or verified-18+ status), donate a GitHub token, and get your own rate-limited API key — no admin required.
+- **Open donation.** Anyone can donate a GitHub token to grow the shared pool at `/donate`, with or without a Hack Club account.
+- **Pooled token rotation** by GitHub rate-limit category (core/search/code_search/graphql), tracked per token.
+- **D1 + R2 caching** of GET/HEAD responses, with TTL and size-based eviction run on a Cron Trigger.
+- **Per-key rate limiting** via a Durable Object token bucket.
+- An **admin dashboard** at `/admin`, gated by Hack Club Auth + an allow-list, with live stats over a Durable-Object-backed WebSocket.
 
-**Ports:** the server listens on **:8080**.  
-**Admin UI:** `http://localhost:8080/admin` (HTTP Basic Auth, creds from env).  
-**API docs:** `http://localhost:8080/docs`.
+This is a full rewrite of an earlier Go/Postgres/Docker version of this service. That version required an admin to manually mint every consumer's API key; this version lets anyone who donates a token get their own.
 
 ---
 
-## Quick start (Docker Compose)
+## Architecture
 
-**Prereqs:** Docker + Docker Compose.
+| Concern | Cloudflare primitive |
+|---|---|
+| HTTP routing | [Hono](https://hono.dev) on Workers |
+| Metadata (keys, donors, identities, stats, cache index) | D1 (SQLite) |
+| Cached GitHub response bodies | R2 |
+| Per-API-key rate limiting | Durable Object (`RateLimiterDO`) |
+| Live admin dashboard stats | Durable Object (`AdminHubDO`), WebSocket Hibernation API |
+| Cache eviction, log/stat pruning | Cron Trigger (`scheduled()`, every minute) |
 
-1) **Create a `.env` file** in the project root. At minimum, set your GitHub OAuth app values if you want the “donate token” flow:
+Donated GitHub tokens are encrypted at rest in D1 with AES-256-GCM (`TOKEN_ENCRYPTION_KEY`), decrypted only for the moment of an upstream GitHub API call.
+
+---
+
+## Local development
+
+**Prereqs:** Node 18+, a Cloudflare account (for `wrangler login`, not required for local dev).
+
+```bash
+npm install
+cp .dev.vars.example .dev.vars
+```
+
+Fill in `.dev.vars`:
 
 ```env
-# --- required for token-donation login (/auth/github) ---
-GITHUB_OAUTH_CLIENT_ID=your_client_id
-GITHUB_OAUTH_CLIENT_SECRET=your_client_secret
-
-# --- admin login (change in production) ---
-ADMIN_USER=admin
-ADMIN_PASS=admin
-
-# --- optional tuning (see full list below) ---
-MAX_CACHE_TIME=300
-MAX_CACHE_SIZE_MB=100
-DB_MAX_CONNS=20
-MAX_PROXY_BODY_BYTES=1048576
-# For local dev the compose file pins BASE_URL to http://localhost:8080
-````
-
-> Tip: Create your GitHub OAuth App with
-> **Homepage URL:** `http://localhost:8080`
-> **Authorization callback URL:** `http://localhost:8080/auth/github/callback`
-> Scope used: `read:user` (read‑only).
-
-2. **Start the stack** (hot‑reload dev server + Postgres):
-
-```bash
-docker compose up --build
-# in another terminal, view logs:
-docker compose logs -f app
+GITHUB_OAUTH_CLIENT_ID=...
+GITHUB_OAUTH_CLIENT_SECRET=...
+HACKCLUB_OAUTH_CLIENT_ID=...
+HACKCLUB_OAUTH_CLIENT_SECRET=...
+TOKEN_ENCRYPTION_KEY=...   # openssl rand -base64 32
+SESSION_SIGNING_KEY=...    # openssl rand -base64 32
 ```
 
-3. **Open the app**:
+> Create a GitHub OAuth App with callback URL `http://localhost:8787/auth/github/callback` and scope `read:user` (read-only). Create a Hack Club Auth OAuth app at [auth.hackclub.com/developer/apps](https://auth.hackclub.com/developer/apps) with callback URL `http://localhost:8787/auth/hackclub/callback` and scopes `openid profile email name slack_id verification_status`.
 
-* Home: `http://localhost:8080/` (donate a token with GitHub)
-* Admin: `http://localhost:8080/admin` (default `admin` / `admin`)
-* API Docs: `http://localhost:8080/docs`
-
-4. **Create an API key** in **/admin**. You’ll see the key **once**—copy it now.
-
-5. **Make a request through the proxy**:
+Apply the D1 schema locally, then start the dev server:
 
 ```bash
-# REST example (public repo)
-curl -H "X-API-Key: YOUR_KEY" \
-  "http://localhost:8080/gh/repos/zachlatta/sshtron"
-
-# GraphQL example
-curl -H "X-API-Key: YOUR_KEY" -H "Content-Type: application/json" \
-  -d '{"query":"{ viewer { login } }"}' \
-  http://localhost:8080/gh/graphql
+npm run db:migrations:apply:local
+npm run dev
 ```
 
-You’ll see helpful response headers like:
+- Home: `http://localhost:8787/`
+- Get your own key: `http://localhost:8787/get-access`
+- Donate a token (no account needed): `http://localhost:8787/donate`
+- Admin: `http://localhost:8787/admin` (needs a Hack Club Auth identity on the admin allow-list — see below)
+- Docs: `http://localhost:8787/docs`
 
-* `X-Gh-Proxy-Cache: hit|miss`
-* `X-Gh-Proxy-Category: core|search|code_search|graphql`
-* `X-Gh-Proxy-Client: <your key identifier>`
-* `X-Gh-Proxy-Donor: <github username>` (when a donated token was used)
+### Admin access locally
 
-> Postgres in dev is exposed on **localhost:5433**. The app in Docker connects to `db:5432` internally.
+The admin allow-list bootstraps itself from `ADMIN_BOOTSTRAP_HC_USER_IDS` (a comma-separated list of Hack Club Auth `sub` values) the first time `/admin` is hit with an empty `admins` table. Set it in `wrangler.toml`'s `[vars]` or override in `.dev.vars` for local dev.
 
----
-
-## Running without Docker (local Go)
-
-1. Start Postgres via Compose (for convenience):
+### Tests
 
 ```bash
-docker compose up -d db
+npm test        # vitest + @cloudflare/vitest-pool-workers (Miniflare-backed)
+npm run typecheck
 ```
-
-2. Create `.env` (same as above). The default `DATABASE_URL` points to the dev DB on **localhost:5433**.
-
-3. Build & run:
-
-```bash
-go build -o ./bin/server ./cmd/server
-./bin/server
-```
-
-Migrations run automatically at startup.
 
 ---
 
 ## Environment configuration
 
-`gh-proxy` reads environment variables and also loads a `.env` file from the working directory.
+| Variable | Where | What it does |
+|---|---|---|
+| `BASE_URL` | `wrangler.toml` var | Public base URL of this deployment. Must match the external scheme+host (OAuth callbacks, WebSocket origin). |
+| `MAX_CACHE_TIME` | var | Cache TTL in seconds for cached responses (`0` = unlimited). |
+| `MAX_CACHE_SIZE_MB` | var | Approximate max size of cached response bodies in R2; oldest entries are evicted first. |
+| `MAX_PROXY_BODY_BYTES` | var | Max allowed request body to `/gh/*` in bytes (`413` if exceeded). |
+| `ALLOWED_VERIFICATION_STATUSES` | var | Comma-separated Hack Club Auth `verification_status` values that qualify for self-serve API access. |
+| `ADMIN_BOOTSTRAP_HC_USER_IDS` | var | Comma-separated Hack Club Auth `sub` values seeded into the `admins` table the first time it's empty. |
+| `GITHUB_OAUTH_CLIENT_ID` / `_SECRET` | secret | GitHub OAuth App used by both `/donate` and `/get-access`'s token-donation step. |
+| `HACKCLUB_OAUTH_CLIENT_ID` / `_SECRET` | secret | Hack Club Auth OAuth App used by `/get-access` and `/admin`. |
+| `TOKEN_ENCRYPTION_KEY` | secret | 32 random bytes, base64-encoded. Encrypts donated GitHub tokens at rest (AES-256-GCM). |
+| `SESSION_SIGNING_KEY` | secret | 32 random bytes, base64-encoded. Signs the Hack Club Auth session cookie (HMAC-SHA256). |
 
-| Variable                     | Required                      | Default                                                                                                                                                          | What it does                                                                                                                         |
-| ---------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `DATABASE_URL`               | **Prod: yes** (Dev: optional) | Dev default: `postgres://ghproxy:ghproxy@localhost:5433/ghproxy?sslmode=disable` (Compose app uses `postgres://ghproxy:ghproxy@db:5432/ghproxy?sslmode=disable`) | Postgres connection string. Migrations run automatically.                                                                            |
-| `BASE_URL`                   | Yes                           | `http://localhost:8080`                                                                                                                                          | Public base URL of this service. **Must match the external scheme+host** (used for OAuth callback + WebSocket origin checks).        |
-| `ADMIN_USER`                 | Yes                           | `admin`                                                                                                                                                          | HTTP Basic username for `/admin`.                                                                                                    |
-| `ADMIN_PASS`                 | Yes                           | `admin`                                                                                                                                                          | HTTP Basic password for `/admin`.                                                                                                    |
-| `GITHUB_OAUTH_CLIENT_ID`     | Needed for token donation     | —                                                                                                                                                                | GitHub OAuth App client ID used by `/auth/github`.                                                                                   |
-| `GITHUB_OAUTH_CLIENT_SECRET` | Needed for token donation     | —                                                                                                                                                                | GitHub OAuth App client secret.                                                                                                      |
-| `MAX_CACHE_TIME`             | No                            | `300`                                                                                                                                                            | Cache TTL **in seconds** for cached responses (`0` = unlimited; stored without expiry). GET/HEAD 200s only; respects public caching. |
-| `MAX_CACHE_SIZE_MB`          | No                            | `100`                                                                                                                                                            | Approximate max size (in MB) of the `cached_responses` table. Oldest rows are trimmed periodically.                                  |
-| `DB_MAX_CONNS`               | No                            | `20`                                                                                                                                                             | Max connections in the Postgres pool.                                                                                                |
-| `MAX_PROXY_BODY_BYTES`       | No                            | `1048576`                                                                                                                                                        | Max allowed request body to `/gh/*` in bytes (returns `413` if exceeded).                                                            |
-
-> If `GITHUB_OAUTH_CLIENT_ID/SECRET` aren’t set, the server still runs, but token donation (the “Donate Token” button) will be disabled.
+> **Note on `ALLOWED_VERIFICATION_STATUSES`:** the exact Hack Club Auth `verification_status` enum (e.g. a "verified eligible" vs. "verified, 18+" distinction) should be confirmed against a live Hack Club Auth OAuth app before launch — this is a one-line config change, not a code change.
 
 ---
 
 ## Endpoints
 
-* **Homepage**: `/` — explains the project and lets users donate a GitHub token.
-* **API Docs**: `/docs` — copy‑paste examples for REST/GraphQL.
-* **Admin**: `/admin` — create/disable API keys, view usage, recent activity.
-* **REST proxy**: `/gh/{path}` — proxies to `https://api.github.com/{path}`
-* **GraphQL proxy**: `/gh/graphql` — proxies to `https://api.github.com/graphql`
+- **Homepage**: `/` — what the project is, links to `/get-access` and `/donate`.
+- **Get access**: `/get-access` — Hack Club Auth login + GitHub token donation → self-serve API key.
+- **Donate**: `/donate` — donate a GitHub token with no account required.
+- **API docs**: `/docs`
+- **Admin**: `/admin` — Hack Club Auth + allow-list protected. Live stats, key list, disable action.
+- **REST proxy**: `/gh/{path}` → `https://api.github.com/{path}`
+- **GraphQL proxy**: `/gh/graphql` → `https://api.github.com/graphql`
 
-All API requests require `X-API-Key: <your key>`.
+All `/gh/*` requests require `X-API-Key: <your key>`.
 
-### Machine‑readable
+### Machine-readable
 
-* **OpenAPI**: `/openapi.json` — OpenAPI 3.0.3 description of every endpoint, header and error shape.
-* **llms.txt**: `/llms.txt` — site map for agents, in the [llmstxt.org](https://llmstxt.org) format.
-* **Sitemap**: `/sitemap.xml`, **Crawler policy**: `/robots.txt`
+- **OpenAPI**: `/openapi.json`
+- **llms.txt**: `/llms.txt` (site map for agents, [llmstxt.org](https://llmstxt.org) format)
+- **Sitemap**: `/sitemap.xml`, **Crawler policy**: `/robots.txt`
 
 ---
 
 ## Errors and rate limit headers
 
-Every error this proxy generates is JSON, never an HTML page:
+Every error is JSON, never an HTML page:
 
 ```json
 {
@@ -156,12 +130,9 @@ Every error this proxy generates is JSON, never an HTML page:
 }
 ```
 
-Branch on `error.code` — it is stable and enumerated in `openapi.json`. `404` and `405` responses
-add an `error.links` array pointing at the entry points above. Unknown paths return a real `404`:
-JSON for API paths or `Accept: application/json`, HTML for browsers, and a short markdown document
-for everything else. Any other status on `/gh/*` is GitHub's own response, forwarded verbatim.
+Branch on `error.code`. `404`/`405` responses add an `error.links` array pointing at the entry points above. Unknown paths return a real `404`: JSON for API paths or `Accept: application/json`, HTML for browsers, markdown for everything else. Any other status on `/gh/*` is GitHub's own response, forwarded verbatim.
 
-Every `/gh/*` response reports your live quota so clients can self‑throttle without waiting for a 429:
+Every `/gh/*` response reports your live quota:
 
 ```
 RateLimit-Limit: 10
@@ -171,52 +142,31 @@ RateLimit-Policy: "default";q=10;w=1
 RateLimit: "default";r=9;t=1
 ```
 
-`RateLimit-Limit`/`-Remaining`/`-Reset` follow the widely deployed convention; `RateLimit` and
-`RateLimit-Policy` follow the IETF `draft-ietf-httpapi-ratelimit-headers` syntax. A `429` adds
-`Retry-After`. `RateLimit-Policy` is sent on every response, so the policy is discoverable without
-spending a request. GitHub's own upstream quota is passed through separately as `X-RateLimit-*`.
+A `429` adds `Retry-After`. GitHub's own upstream quota is passed through separately as `X-RateLimit-*`.
 
 ---
 
-## How it works (one‑minute version)
-
-* **Token rotation:** Donated tokens are stored (read‑only scope). The proxy rotates tokens and tracks category‑specific GitHub rate limits. Revoked/unauthorized tokens are marked and skipped automatically.
-* **Caching:** GET/HEAD successful responses are cached in Postgres with a TTL and size cap. Periodic jobs trim old cache rows and keep only recent request logs.
-* **Rate limiting:** Each API key has a per‑second limit (default **10 rps**) configured when the key is created.
-
----
-
-## Production (container)
-
-Build and run as a single container (provide your own Postgres):
+## Deploying
 
 ```bash
-# Build a minimal image
-docker build -t gh-proxy:latest -f Dockerfile .
-
-# Run (example)
-docker run --rm -p 8080:8080 --env-file .env \
-  -e DATABASE_URL="postgres://user:pass@host:5432/ghproxy?sslmode=disable" \
-  gh-proxy:latest
+npx wrangler d1 create gh-proxy          # then paste the returned database_id into wrangler.toml
+npx wrangler r2 bucket create gh-proxy-cache
+npx wrangler secret put GITHUB_OAUTH_CLIENT_ID
+npx wrangler secret put GITHUB_OAUTH_CLIENT_SECRET
+npx wrangler secret put HACKCLUB_OAUTH_CLIENT_ID
+npx wrangler secret put HACKCLUB_OAUTH_CLIENT_SECRET
+npx wrangler secret put TOKEN_ENCRYPTION_KEY
+npx wrangler secret put SESSION_SIGNING_KEY
+npm run db:migrations:apply:remote
+npm run deploy
 ```
 
-> In production, set `BASE_URL` to your public HTTPS URL (e.g., `https://proxy.example.org`) so OAuth and the admin WebSocket work correctly. Change `ADMIN_USER/ADMIN_PASS`.
+Set `BASE_URL` in `wrangler.toml` to your public HTTPS URL, and update the GitHub/Hack Club Auth OAuth apps' callback URLs to match.
 
 ---
 
-## Troubleshooting
+## How it works
 
-* **OAuth login fails / admin live stats don’t update:** Ensure `BASE_URL` exactly matches the public origin (scheme + hostname + port).
-* **“missing X-API-Key” (401):** Include your API key header on `/gh/*` requests.
-* **429 Too Many Requests:** Your key hit its per‑second rate limit; lower concurrency or request fewer times per second. Read `RateLimit-Remaining` and `Retry-After` to pace requests.
-* **401 `INVALID_API_KEY`:** The key was sent but is not in the database. Check for whitespace or a truncated value.
-* **502 `UPSTREAM_ERROR`:** The proxy could not reach GitHub — usually no usable donated token. Retry with backoff.
-* **413 Request Entity Too Large:** Increase `MAX_PROXY_BODY_BYTES` if you need to send larger GraphQL payloads.
-
----
-
-## Development notes
-
-* Hot‑reload is provided in the dev container via `air`.
-* Server logs include request lines, admin actions, OAuth events, cache activity, and errors.
-* See **`DEVELOPMENT.md`** for logging commands and tips.
+- **Token rotation:** donated tokens are encrypted at rest. The proxy picks the token with the most remaining quota for the request's category (core/search/code_search/graphql), tracked per token in D1. Revoked/unauthorized tokens are marked and skipped; re-donating clears the revocation.
+- **Caching:** GET/HEAD 200 responses are cached — the response body in R2, a small index row in D1. A Cron Trigger sweeps expired entries and evicts the oldest ones once the pool exceeds `MAX_CACHE_SIZE_MB`.
+- **Rate limiting:** each API key has a per-second limit (default 10 rps), enforced by a dedicated Durable Object per key.

@@ -1,40 +1,16 @@
 version: 2
-registries:
-  dhi:
-    type: docker-registry
-    url: dhi.io
-    username: ${{secrets.DHI_USERNAME}}
-    password: ${{secrets.DHI_TOKEN}}
 
 updates:
-  - package-ecosystem: gomod
+  - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
       day: monday
     groups:
-      go-modules:
+      npm-dependencies:
         patterns:
           - "*"
     open-pull-requests-limit: 10
-
-  - package-ecosystem: docker
-    directory: /
-    registries:
-      - dhi
-    schedule:
-      interval: weekly
-      day: monday
-    groups:
-      docker:
-        patterns:
-          - "*"
-
-  - package-ecosystem: docker-compose
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
 
   - package-ecosystem: github-actions
     directory: /
